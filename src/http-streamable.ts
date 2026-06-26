@@ -246,7 +246,8 @@ app.options('/mcp', (_req, res) => {
   res.sendStatus(200);
 });
 
-const HOST = process.env.MCP_HOST || '127.0.0.1';
+// ✅ CORRIGIDO: usa 0.0.0.0 por padrão para funcionar no Render
+const HOST = process.env.MCP_HOST || '0.0.0.0';
 app.listen(PORT, HOST, () => {
   logger.info(`Servidor MCP Kommo v2.0.0 rodando em http://${HOST}:${PORT}`, {
     tools: MCP_TOOLS.length,
