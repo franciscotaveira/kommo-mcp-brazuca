@@ -30,24 +30,39 @@ const logger = {
   },
 };
 
-const kommoAPI = new KommoAPI({
+// ── Instância padrão (fallback para variáveis de ambiente) ──
+const defaultKommoAPI = new KommoAPI({
   baseUrl: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
   accessToken: process.env.KOMMO_ACCESS_TOKEN || '',
 });
 
+// ── Retorna a instância correta baseada nos headers da requisição ──
+function getKommoAPI(req: express.Request): KommoAPI {
+  const headerToken = req.headers['x-kommo-token'] as string | undefined;
+  const headerUrl   = req.headers['x-kommo-url']   as string | undefined;
+
+  if (headerToken && headerUrl) {
+    return new KommoAPI({ baseUrl: headerUrl, accessToken: headerToken });
+  }
+  return defaultKommoAPI;
+}
+
 app.use(cors());
 app.use(express.json());
 
+// ── Health check ──
 app.get('/health', (_req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '2.0.0',
+    version: '2.1.0',
+    mode: 'multi-workspace',
     tools_count: MCP_TOOLS.length,
     resources_count: MCP_RESOURCES.length,
     prompts_count: MCP_PROMPTS.length,
     environment: process.env.NODE_ENV || 'development',
-    kommo_base_url: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
+    default_kommo_base_url: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
+    info: 'Passe X-Kommo-Token e X-Kommo-Url nos headers para usar outra workspace',
   });
 });
 
@@ -73,14 +88,14 @@ function sendMcpResponse(res: express.Response, payload: object, req: express.Re
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key, X-Kommo-Token, X-Kommo-Url');
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
     res.end();
   }
 }
 
 app.post('/mcp', async (req, res) => {
-  logger.info('Requisição MCP Kommo');
+  logger.info('Requisição MCP Kommo Multi-Workspace');
 
   const allowedOrigins = process.env.MCP_ALLOWED_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean);
   if (allowedOrigins && allowedOrigins.length > 0) {
@@ -146,8 +161,8 @@ app.post('/mcp', async (req, res) => {
           },
           serverInfo: {
             name: 'kommo-mcp-server',
-            version: '2.0.0',
-            description: 'MCP Server for Kommo CRM integration',
+            version: '2.1.0',
+            description: 'MCP Server Multi-Workspace para Kommo CRM — Grupo Brazucas',
           },
         },
       };
@@ -171,6 +186,9 @@ app.post('/mcp', async (req, res) => {
     if (method === 'tools/call') {
       const { name, arguments: args } = params;
       logger.debug('Executando ferramenta', { name, args });
+
+      // ── Resolve a workspace correta para esta requisição ──
+      const kommoAPI = getKommoAPI(req);
 
       try {
         const result = await executeTool(kommoAPI, name, args);
@@ -203,6 +221,7 @@ app.post('/mcp', async (req, res) => {
         return;
       }
       try {
+        const kommoAPI = getKommoAPI(req);
         const text = await readResource(kommoAPI, uri);
         sendMcpResponse(res, { jsonrpc: '2.0', id, result: { contents: [{ uri, mimeType: 'application/json', text }] } }, req);
       } catch (err) {
@@ -242,17 +261,18 @@ app.post('/mcp', async (req, res) => {
 app.options('/mcp', (_req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key, X-Kommo-Token, X-Kommo-Url');
   res.sendStatus(200);
 });
 
-// ✅ CORRIGIDO: usa 0.0.0.0 por padrão para funcionar no Render
+// ✅ Bind em 0.0.0.0 para funcionar no Render
 const HOST = process.env.MCP_HOST || '0.0.0.0';
 app.listen(PORT, HOST, () => {
-  logger.info(`Servidor MCP Kommo v2.0.0 rodando em http://${HOST}:${PORT}`, {
+  logger.info(`Servidor MCP Kommo v2.1.0 Multi-Workspace rodando em http://${HOST}:${PORT}`, {
     tools: MCP_TOOLS.length,
     resources: MCP_RESOURCES.length,
     prompts: MCP_PROMPTS.length,
-    kommo_base_url: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
+    default_kommo_base_url: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
+    mode: 'multi-workspace',
   });
 });
