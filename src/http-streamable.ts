@@ -30,22 +30,51 @@ const logger = {
   },
 };
 
-// ── Instância padrão (fallback para variáveis de ambiente) ──
-const defaultKommoAPI = new KommoAPI({
-  baseUrl: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
-  accessToken: process.env.KOMMO_ACCESS_TOKEN || '',
-});
+// ── Mapa de workspaces a partir das variáveis de ambiente ──
+const WORKSPACES: Record<string, { url: string; token: string }> = {
+  smart: {
+    url: process.env.KOMMO_BASE_URL || 'https://videographerseua.kommo.com',
+    token: process.env.KOMMO_ACCESS_TOKEN || '',
+  },
+  amavi: {
+    url: process.env.KOMMO_AMAVI_URL || '',
+    token: process.env.KOMMO_AMAVI_TOKEN || '',
+  },
+  manakadett: {
+    url: process.env.KOMMO_MANAKADETT_URL || '',
+    token: process.env.KOMMO_MANAKADETT_TOKEN || '',
+  },
+};
 
-// ── Retorna a instância correta baseada nos headers da requisição ──
-function getKommoAPI(req: express.Request): KommoAPI {
-  const headerToken = req.headers['x-kommo-token'] as string | undefined;
-  const headerUrl   = req.headers['x-kommo-url']   as string | undefined;
+// ── Workspace ativa por sessão ──
+const sessionWorkspaces = new Map<string, string>();
 
-  if (headerToken && headerUrl) {
-    return new KommoAPI({ baseUrl: headerUrl, accessToken: headerToken });
-  }
-  return defaultKommoAPI;
+function getWorkspaceName(sessionId: string): string {
+  return sessionWorkspaces.get(sessionId) || 'smart';
 }
+
+function getKommoAPIForSession(sessionId: string): KommoAPI {
+  const name = getWorkspaceName(sessionId);
+  const ws = WORKSPACES[name] || WORKSPACES['smart'];
+  return new KommoAPI({ baseUrl: ws.url, accessToken: ws.token });
+}
+
+// ── Tool extra: switch_workspace ──
+const SWITCH_WORKSPACE_TOOL = {
+  name: 'switch_workspace',
+  description: 'Troca a workspace ativa do Kommo. Workspaces disponíveis: smart, amavi, manakadett.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      workspace: {
+        type: 'string',
+        description: 'Nome da workspace: smart, amavi ou manakadett',
+        enum: Object.keys(WORKSPACES),
+      },
+    },
+    required: ['workspace'],
+  },
+};
 
 app.use(cors());
 app.use(express.json());
@@ -55,14 +84,12 @@ app.get('/health', (_req, res) => {
   res.json({
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    version: '2.1.0',
+    version: '2.2.0',
     mode: 'multi-workspace',
-    tools_count: MCP_TOOLS.length,
+    workspaces: Object.keys(WORKSPACES),
+    tools_count: MCP_TOOLS.length + 1,
     resources_count: MCP_RESOURCES.length,
     prompts_count: MCP_PROMPTS.length,
-    environment: process.env.NODE_ENV || 'development',
-    default_kommo_base_url: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
-    info: 'Passe X-Kommo-Token e X-Kommo-Url nos headers para usar outra workspace',
   });
 });
 
@@ -70,12 +97,12 @@ const MCP_PROTOCOL_VERSION = '2025-06-18';
 const SUPPORTED_PROTOCOL_VERSIONS = ['2025-06-18', '2024-11-05', '2025-11-25'];
 const mcpSessions = new Map<string, { initialized: boolean }>();
 
-function getOrCreateSession(sessionId: string | undefined): { initialized: boolean } {
+function getOrCreateSession(sessionId: string | undefined): { id: string; initialized: boolean } {
   const id = sessionId || 'default';
   if (!mcpSessions.has(id)) {
     mcpSessions.set(id, { initialized: false });
   }
-  return mcpSessions.get(id)!;
+  return { id, ...mcpSessions.get(id)! };
 }
 
 function sendMcpResponse(res: express.Response, payload: object, req: express.Request): void {
@@ -88,30 +115,21 @@ function sendMcpResponse(res: express.Response, payload: object, req: express.Re
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key, X-Kommo-Token, X-Kommo-Url');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key');
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
     res.end();
   }
 }
 
 app.post('/mcp', async (req, res) => {
-  logger.info('Requisição MCP Kommo Multi-Workspace');
-
-  const allowedOrigins = process.env.MCP_ALLOWED_ORIGINS?.split(',').map((o) => o.trim()).filter(Boolean);
-  if (allowedOrigins && allowedOrigins.length > 0) {
-    const origin = req.headers.origin;
-    if (origin && !allowedOrigins.includes(origin)) {
-      res.status(403).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Origin not allowed' } });
-      return;
-    }
-  }
+  logger.info('Requisição MCP Kommo Multi-Workspace v2.2.0');
 
   const authToken = process.env.MCP_AUTH_TOKEN;
   if (authToken) {
     const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     const apiKey = req.headers['x-api-key'];
     if ((bearer || apiKey) !== authToken) {
-      res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized: invalid or missing token' } });
+      res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' } });
       return;
     }
   }
@@ -119,19 +137,19 @@ app.post('/mcp', async (req, res) => {
   try {
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
-      res.status(400).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid request: body must be a single JSON object' } });
+      res.status(400).json({ jsonrpc: '2.0', error: { code: -32600, message: 'Invalid request' } });
       return;
     }
 
     const { method, params, id } = body;
-    logger.debug('Requisição MCP recebida', { method, params, id });
+    const sessionId = (req.headers['mcp-session-id'] as string) || 'default';
 
     if (method !== 'initialize') {
       const protocolVersion = req.headers['mcp-protocol-version'] as string | undefined;
       if (!protocolVersion || !SUPPORTED_PROTOCOL_VERSIONS.includes(protocolVersion)) {
         res.status(400).json({
           jsonrpc: '2.0',
-          error: { code: -32600, message: 'Missing or unsupported MCP-Protocol-Version header', data: { supported: SUPPORTED_PROTOCOL_VERSIONS } },
+          error: { code: -32600, message: 'Missing or unsupported MCP-Protocol-Version header' },
         });
         return;
       }
@@ -139,8 +157,8 @@ app.post('/mcp', async (req, res) => {
 
     if (id === undefined && method !== undefined) {
       if (method === 'notifications/initialized') {
-        const session = getOrCreateSession(req.headers['mcp-session-id'] as string | undefined);
-        session.initialized = true;
+        const session = getOrCreateSession(sessionId);
+        mcpSessions.set(session.id, { initialized: true });
       }
       res.status(202).end();
       return;
@@ -148,7 +166,8 @@ app.post('/mcp', async (req, res) => {
 
     if (method === 'initialize') {
       const newSessionId = crypto.randomUUID();
-      getOrCreateSession(newSessionId);
+      mcpSessions.set(newSessionId, { initialized: false });
+      sessionWorkspaces.set(newSessionId, 'smart'); // padrão: GRUPO SMART
       const initResponse = {
         jsonrpc: '2.0' as const,
         id,
@@ -161,8 +180,8 @@ app.post('/mcp', async (req, res) => {
           },
           serverInfo: {
             name: 'kommo-mcp-server',
-            version: '2.1.0',
-            description: 'MCP Server Multi-Workspace para Kommo CRM — Grupo Brazucas',
+            version: '2.2.0',
+            description: 'MCP Multi-Workspace Kommo — Grupo Brazucas. Use switch_workspace para trocar de cliente.',
           },
         },
       };
@@ -172,36 +191,56 @@ app.post('/mcp', async (req, res) => {
     }
 
     if (method === 'notifications/initialized') {
-      const session = getOrCreateSession(req.headers['mcp-session-id'] as string | undefined);
-      session.initialized = true;
+      mcpSessions.set(sessionId, { initialized: true });
       res.status(202).end();
       return;
     }
 
     if (method === 'tools/list') {
-      sendMcpResponse(res, { jsonrpc: '2.0', id, result: { tools: MCP_TOOLS } }, req);
+      const allTools = [...MCP_TOOLS, SWITCH_WORKSPACE_TOOL];
+      sendMcpResponse(res, { jsonrpc: '2.0', id, result: { tools: allTools } }, req);
       return;
     }
 
     if (method === 'tools/call') {
       const { name, arguments: args } = params;
-      logger.debug('Executando ferramenta', { name, args });
 
-      // ── Resolve a workspace correta para esta requisição ──
-      const kommoAPI = getKommoAPI(req);
+      // ── Tool especial: switch_workspace ──
+      if (name === 'switch_workspace') {
+        const wsName = args?.workspace as string;
+        if (!WORKSPACES[wsName]) {
+          sendMcpResponse(res, {
+            jsonrpc: '2.0', id,
+            result: {
+              content: [{ type: 'text', text: `Workspace "${wsName}" não encontrada. Disponíveis: ${Object.keys(WORKSPACES).join(', ')}` }],
+              isError: true,
+            },
+          }, req);
+          return;
+        }
+        sessionWorkspaces.set(sessionId, wsName);
+        const ws = WORKSPACES[wsName];
+        sendMcpResponse(res, {
+          jsonrpc: '2.0', id,
+          result: {
+            content: [{ type: 'text', text: `✅ Workspace trocada para "${wsName}" (${ws.url})` }],
+          },
+        }, req);
+        return;
+      }
 
+      // ── Demais tools — usa workspace da sessão ──
+      const kommoAPI = getKommoAPIForSession(sessionId);
       try {
         const result = await executeTool(kommoAPI, name, args);
         sendMcpResponse(res, { jsonrpc: '2.0', id, result }, req);
       } catch (error) {
-        logger.error(`Erro ao executar ferramenta ${name}`, error);
         const message = error instanceof Error ? error.message : 'Internal error';
         if (message.startsWith('Unknown tool:')) {
           sendMcpResponse(res, { jsonrpc: '2.0', id, error: { code: -32601, message } }, req);
         } else {
           sendMcpResponse(res, {
-            jsonrpc: '2.0',
-            id,
+            jsonrpc: '2.0', id,
             result: { content: [{ type: 'text' as const, text: message }], isError: true },
           }, req);
         }
@@ -217,11 +256,11 @@ app.post('/mcp', async (req, res) => {
     if (method === 'resources/read') {
       const uri = params?.uri as string | undefined;
       if (!uri || !isKnownResource(uri)) {
-        sendMcpResponse(res, { jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown resource URI', data: { uri } } }, req);
+        sendMcpResponse(res, { jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown resource URI' } }, req);
         return;
       }
       try {
-        const kommoAPI = getKommoAPI(req);
+        const kommoAPI = getKommoAPIForSession(sessionId);
         const text = await readResource(kommoAPI, uri);
         sendMcpResponse(res, { jsonrpc: '2.0', id, result: { contents: [{ uri, mimeType: 'application/json', text }] } }, req);
       } catch (err) {
@@ -239,7 +278,7 @@ app.post('/mcp', async (req, res) => {
     if (method === 'prompts/get') {
       const promptName = params?.name as string | undefined;
       if (!promptName || !isKnownPrompt(promptName)) {
-        sendMcpResponse(res, { jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown prompt name', data: { name: promptName } } }, req);
+        sendMcpResponse(res, { jsonrpc: '2.0', id, error: { code: -32602, message: 'Unknown prompt name' } }, req);
         return;
       }
       sendMcpResponse(res, { jsonrpc: '2.0', id, result: { messages: getPromptMessages(promptName) } }, req);
@@ -249,30 +288,24 @@ app.post('/mcp', async (req, res) => {
     sendMcpResponse(res, { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${method}` } }, req);
   } catch (error) {
     logger.error('Erro no endpoint MCP', error);
-    const errorResponse = { jsonrpc: '2.0', id: req.body?.id || 1, error: { code: -32603, message: 'Internal error' } };
-    if (typeof req.body === 'object' && !Array.isArray(req.body)) {
-      sendMcpResponse(res, errorResponse, req);
-    } else {
-      res.status(500).json(errorResponse);
-    }
+    res.status(500).json({ jsonrpc: '2.0', id: req.body?.id || 1, error: { code: -32603, message: 'Internal error' } });
   }
 });
 
 app.options('/mcp', (_req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key, X-Kommo-Token, X-Kommo-Url');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, MCP-Protocol-Version, MCP-Session-Id, Authorization, X-API-Key');
   res.sendStatus(200);
 });
 
-// ✅ Bind em 0.0.0.0 para funcionar no Render
+// ✅ 0.0.0.0 para funcionar no Render
 const HOST = process.env.MCP_HOST || '0.0.0.0';
 app.listen(PORT, HOST, () => {
-  logger.info(`Servidor MCP Kommo v2.1.0 Multi-Workspace rodando em http://${HOST}:${PORT}`, {
-    tools: MCP_TOOLS.length,
+  logger.info(`Servidor MCP Kommo v2.2.0 Multi-Workspace rodando em http://${HOST}:${PORT}`, {
+    workspaces: Object.keys(WORKSPACES),
+    tools: MCP_TOOLS.length + 1,
     resources: MCP_RESOURCES.length,
     prompts: MCP_PROMPTS.length,
-    default_kommo_base_url: process.env.KOMMO_BASE_URL || 'https://api-g.kommo.com',
-    mode: 'multi-workspace',
   });
 });
